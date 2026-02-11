@@ -19,72 +19,114 @@ def load_data(uploaded_file):
     """
     Ingests the complex Excel file, handles multi-sheet logic and cleaning.
     """
-    xls = pd.ExcelFile(uploaded_file)
-    sheet_names = xls.sheet_names
-    
-    # 1. Load S&OP (Master Data)
-    # Heuristic: Look for sheet with "S&OP" or "Meeting"
-    sop_sheet = next((s for s in sheet_names if "S&OP" in s or "Meeting" in s), None)
-    
-    if not sop_sheet:
-        st.error("❌ Critical: S&OP sheet not found in Excel.")
-        return None, None
-
-    # Load S&OP with specific offset (Row 2 based on analysis)
-    df_sop = pd.read_excel(xls, sheet_name=sop_sheet, header=1)
-    
-    # Clean S&OP
-    # The first column is often unnamed but contains Order ID. Rename it.
-    df_sop.rename(columns={df_sop.columns[0]: 'Order_ID'}, inplace=True)
-    
-    # Filter out garbage rows (metadata, instructions)
-    # Logic: Order_ID must be numeric-ish or valid string, not "input" or "formula"
-    df_sop = df_sop[~df_sop['Order_ID'].astype(str).str.lower().isin(['input', 'formula', 'nan', 'order number'])]
-    df_sop = df_sop.dropna(subset=['Order_ID']) # Drop empty IDs
-    
-    # Convert Dates
-    date_cols = [col for col in df_sop.columns if 'date' in col.lower()]
-    for col in date_cols:
-        df_sop[col] = pd.to_datetime(df_sop[col], errors='coerce')
-
-    # 2. Load Orders (Detail Data)
-    # Heuristic: Look for "Orders" sheet, header at row 21 (index 20)
-    orders_sheet = next((s for s in sheet_names if s.strip() == "Orders"), None)
-    if orders_sheet:
-        df_orders = pd.read_excel(xls, sheet_name=orders_sheet, header=20)
-        # Clean Orders
-        # Ensure Order_ID matches S&OP format (often string vs int issue)
-        df_orders.rename(columns={df_orders.columns[0]: 'Order_ID'}, inplace=True)
-        df_orders['Order_ID'] = df_orders['Order_ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+        sheet_names = xls.sheet_names
         
-        # Aggregate Quantity by Order
-        # Assume 'Quantity' column exists. If not, try to fuzzy find it.
-        qty_col = next((c for c in df_orders.columns if 'quantity' in c.lower()), None)
-        if qty_col:
-            df_agg = df_orders.groupby('Order_ID')[qty_col].sum().reset_index()
-            df_agg.rename(columns={qty_col: 'Total_Qty'}, inplace=True)
-            
-            # Merge into S&OP
-            df_sop['Order_ID'] = df_sop['Order_ID'].astype(str).str.replace(r'\.0$', '', regex=True)
-            df_sop = pd.merge(df_sop, df_agg, on='Order_ID', how='left')
+        # 1. Load S&OP (Master Data)
+        # Heuristic: Look for sheet with "S&OP" or "Meeting"
+        sop_sheet = next((s for s in sheet_names if "S&OP" in s or "Meeting" in s), None)
+        
+        if not sop_sheet:
+            st.error("❌ Critical: S&OP sheet not found in Excel.")
+            return None, None
+
+        # --- SMART HEADER DETECTION ---
+        # Read first 10 rows to find where the actual header is (looking for 'Status' and 'Country')
+        df_preview = pd.read_excel(xls, sheet_name=sop_sheet, header=None, nrows=10)
+        header_idx = 0
+        found_header = False
+        
+        for idx, row in df_preview.iterrows():
+            # Convert row to string and check for keywords
+            row_str = row.astype(str).str.lower().tolist()
+            if 'status' in row_str and 'country' in row_str:
+                header_idx = idx
+                found_header = True
+                break
+        
+        # Load with identified header
+        df_sop = pd.read_excel(xls, sheet_name=sop_sheet, header=header_idx)
+        
+        # Clean Column Names (strip whitespace)
+        df_sop.columns = df_sop.columns.str.strip()
+        
+        # Rename first column to Order_ID if it looks like the ID column (often unnamed in CSVs)
+        if 'Proforma #' in df_sop.columns:
+             df_sop.rename(columns={'Proforma #': 'Order_ID'}, inplace=True)
         else:
-            df_sop['Total_Qty'] = 0 # Fallback
-    else:
-        df_sop['Total_Qty'] = 0
+             # Fallback: Rename the first column
+             df_sop.rename(columns={df_sop.columns[0]: 'Order_ID'}, inplace=True)
 
-    # 3. Final Polish
-    # Normalize Status
-    if 'Status' in df_sop.columns:
-        df_sop['Status'] = df_sop['Status'].fillna('Unknown').astype(str).str.upper().str.strip()
-    
-    # Normalize Pallets
-    pallet_col = next((c for c in df_sop.columns if 'pallet' in c.lower()), None)
-    if pallet_col:
-        df_sop['Pallets'] = pd.to_numeric(df_sop[pallet_col], errors='coerce').fillna(0)
-    else:
-        df_sop['Pallets'] = 0
+        # Filter out garbage rows (metadata, instructions like 'input', 'formula')
+        if 'Order_ID' in df_sop.columns:
+            df_sop = df_sop[~df_sop['Order_ID'].astype(str).str.lower().isin(['input', 'formula', 'nan', 'order number'])]
+            df_sop = df_sop.dropna(subset=['Order_ID']) # Drop empty IDs
         
-    return df_sop, sheet_names
+        # Convert Dates
+        date_cols = [col for col in df_sop.columns if 'date' in col.lower()]
+        for col in date_cols:
+            df_sop[col] = pd.to_datetime(df_sop[col], errors='coerce')
+
+        # 2. Load Orders (Detail Data)
+        # Heuristic: Look for "Orders" sheet
+        orders_sheet = next((s for s in sheet_names if s.strip() == "Orders"), None)
+        df_sop['Total_Qty'] = 0 # Default initialization
+        
+        if orders_sheet:
+            # Smart Header for Orders sheet too (often starts at row 20+)
+            df_ord_preview = pd.read_excel(xls, sheet_name=orders_sheet, header=None, nrows=30)
+            ord_header_idx = 20 # Default fallback
+            
+            for idx, row in df_ord_preview.iterrows():
+                row_str = row.astype(str).str.lower().tolist()
+                # Look for 'order number' or 'sku'
+                if any('order' in x and 'number' in x for x in row_str):
+                    ord_header_idx = idx
+                    break
+            
+            df_orders = pd.read_excel(xls, sheet_name=orders_sheet, header=ord_header_idx)
+            df_orders.columns = df_orders.columns.str.strip()
+            
+            # Rename Order ID column
+            # Find column with 'Order' and 'number'
+            oid_col = next((c for c in df_orders.columns if 'order' in c.lower() and 'number' in c.lower()), df_orders.columns[0])
+            df_orders.rename(columns={oid_col: 'Order_ID'}, inplace=True)
+            
+            # Clean IDs for merging
+            df_orders['Order_ID'] = df_orders['Order_ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+            
+            # Aggregate Quantity
+            qty_col = next((c for c in df_orders.columns if 'quantity' in c.lower()), None)
+            if qty_col:
+                df_agg = df_orders.groupby('Order_ID')[qty_col].sum().reset_index()
+                df_agg.rename(columns={qty_col: 'Total_Qty'}, inplace=True)
+                
+                # Merge into S&OP
+                df_sop['Order_ID'] = df_sop['Order_ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+                df_sop = pd.merge(df_sop, df_agg, on='Order_ID', how='left')
+                df_sop['Total_Qty'] = df_sop['Total_Qty'].fillna(0)
+
+        # 3. Final Polish
+        # Normalize Status
+        if 'Status' in df_sop.columns:
+            df_sop['Status'] = df_sop['Status'].fillna('Unknown').astype(str).str.upper().str.strip()
+        else:
+            # Fallback if Status column is missing entirely to prevent crash
+            df_sop['Status'] = 'UNKNOWN'
+        
+        # Normalize Pallets
+        pallet_col = next((c for c in df_sop.columns if 'pallet' in c.lower()), None)
+        if pallet_col:
+            df_sop['Pallets'] = pd.to_numeric(df_sop[pallet_col], errors='coerce').fillna(0)
+        else:
+            df_sop['Pallets'] = 0
+            
+        return df_sop, sheet_names
+        
+    except Exception as e:
+        st.error(f"Error processing file: {e}")
+        return None, None
 
 # --- UI LAYOUT ---
 def main():
@@ -95,11 +137,6 @@ def main():
     if not uploaded_file:
         st.title("🚀 Board Room S&OP Dashboard")
         st.info("👆 Please upload the master `ORDERS.xlsx` file to begin.")
-        st.markdown("""
-        **Expected File Structure:**
-        * Sheet `S&OP Meeting...`: Main control sheet.
-        * Sheet `Orders`: SKU details (header row ~21).
-        """)
         return
 
     # Load Data
@@ -112,7 +149,7 @@ def main():
     # --- SIDEBAR FILTERS ---
     st.sidebar.divider()
     
-    # Year/Month Filter based on Order Date
+    # Year/Month Filter
     date_col = next((c for c in df.columns if 'entry date' in c.lower()), None)
     if date_col:
         min_date = df[date_col].min()
@@ -125,11 +162,10 @@ def main():
             df = df[(df[date_col] >= pd.to_datetime(start_date)) & (df[date_col] <= pd.to_datetime(end_date))]
 
     # Status Filter
-    if 'Status' in df.columns:
-        statuses = ['All'] + sorted(df['Status'].unique().tolist())
-        selected_status = st.sidebar.selectbox("Order Status", statuses)
-        if selected_status != 'All':
-            df = df[df['Status'] == selected_status]
+    statuses = ['All'] + sorted(df['Status'].unique().tolist())
+    selected_status = st.sidebar.selectbox("Order Status", statuses)
+    if selected_status != 'All':
+        df = df[df['Status'] == selected_status]
 
     # Country Filter
     if 'Country' in df.columns:
@@ -143,14 +179,19 @@ def main():
     total_pallets = df['Pallets'].sum()
     total_qty = df['Total_Qty'].sum()
     
-    # Status Buckets
-    hold_orders = df[df['Status'].str.contains('HOLD', na=False)]
-    open_orders = df[~df['Status'].str.contains('HOLD|COMPLETE|FINAL', na=False)]
-    completed_orders = df[df['Status'].str.contains('COMPLETE|FINAL', na=False)]
-    
+    # SAFE STATUS BUCKETS (Prevents KeyError)
+    if 'Status' in df.columns:
+        hold_orders = df[df['Status'].str.contains('HOLD', na=False)]
+        open_orders = df[~df['Status'].str.contains('HOLD|COMPLETE|FINAL', na=False)]
+    else:
+        hold_orders = pd.DataFrame(columns=df.columns)
+        open_orders = df
+
     # Financial Block
     payment_col = next((c for c in df.columns if 'payment' in c.lower() and 'status' in c.lower()), None)
-    blocked_payment = df[df[payment_col].astype(str).str.contains('PAYMENT', case=False, na=False)] if payment_col else pd.DataFrame()
+    blocked_payment = pd.DataFrame()
+    if payment_col:
+         blocked_payment = df[df[payment_col].astype(str).str.contains('PAYMENT', case=False, na=False)]
 
     # --- MAIN DASHBOARD ---
     st.title(f"📊 S&OP Control Tower")
@@ -171,7 +212,6 @@ def main():
         
         with c1:
             st.subheader("Pipeline Flow (Status)")
-            # Funnel Logic
             status_counts = df['Status'].value_counts().reset_index()
             status_counts.columns = ['Status', 'Count']
             fig_funnel = px.funnel(status_counts, x='Count', y='Status', title="Order Lifecycle Funnel")
@@ -185,7 +225,6 @@ def main():
                 st.plotly_chart(fig_pie, use_container_width=True)
 
         st.subheader("⚠️ Critical Attention Required (Hold > 30 Days)")
-        # Mock logic for "Aging" since we might not have exact aging calculation
         if date_col:
             now = pd.Timestamp.now()
             df['Days_Open'] = (now - df[date_col]).dt.days
@@ -201,10 +240,12 @@ def main():
         
         with col_pay1:
             if payment_col:
-                pay_summary = df[payment_col].value_counts().reset_index()
+                pay_summary = df[payment_col].fillna('Unknown').value_counts().reset_index()
                 pay_summary.columns = ['Payment Status', 'Count']
                 fig_pay = px.bar(pay_summary, x='Payment Status', y='Count', color='Payment Status', title="Orders by Payment Status")
                 st.plotly_chart(fig_pay, use_container_width=True)
+            else:
+                st.info("Payment Status column not found.")
         
         with col_pay2:
             st.info("💡 Insight: Orders marked 'PAYMENT' cannot ship until cleared.")
@@ -221,7 +262,7 @@ def main():
         
         if ready_col and ship_col:
             gantt_df = df.dropna(subset=[ready_col, ship_col]).copy()
-            gantt_df = gantt_df.head(50) # Limit for readability
+            gantt_df = gantt_df.head(50) # Limit
             
             fig_gantt = px.timeline(
                 gantt_df, 
