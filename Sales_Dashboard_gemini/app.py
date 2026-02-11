@@ -32,13 +32,12 @@ def load_data(uploaded_file):
 
         # --- SMART HEADER DETECTION (Safe Mode) ---
         # Read first 15 rows to find where the actual header is
-        # We look for a row that contains 'Status' AND 'Country' (case insensitive)
         df_preview = pd.read_excel(xls, sheet_name=sop_sheet, header=None, nrows=15)
         header_idx = 0
         
         for idx, row in df_preview.iterrows():
-            # Convert entire row to string safely to avoid int errors
             row_str = row.astype(str).str.lower().tolist()
+            # Look for row containing both 'status' and 'country'
             if any('status' in x for x in row_str) and any('country' in x for x in row_str):
                 header_idx = idx
                 break
@@ -46,68 +45,75 @@ def load_data(uploaded_file):
         # Load with identified header
         df_sop = pd.read_excel(xls, sheet_name=sop_sheet, header=header_idx)
         
-        # SAFETY FIX: Force all columns to be strings to prevent 'int' errors
+        # Force column names to string to avoid Int/Object errors
         df_sop.columns = df_sop.columns.astype(str).str.strip()
         
-        # Rename Order ID column (Handle variations)
-        # Look for column containing 'Proforma' or just use first column
+        # Rename Order ID column
         id_col = next((c for c in df_sop.columns if 'Proforma' in c), df_sop.columns[0])
         df_sop.rename(columns={id_col: 'Order_ID'}, inplace=True)
 
-        # Filter out garbage rows (metadata, instructions like 'input', 'formula')
+        # Filter out garbage rows
         if 'Order_ID' in df_sop.columns:
-            # Drop rows where Order_ID is 'input', 'formula', or NaN
-            # Safe conversion to string before checking
             df_sop = df_sop[~df_sop['Order_ID'].astype(str).str.lower().isin(['input', 'formula', 'nan', 'order number'])]
             df_sop = df_sop.dropna(subset=['Order_ID'])
         
         # Convert Dates
-        # Safe column search: str(col).lower() handles integer column names
         date_cols = [col for col in df_sop.columns if 'date' in str(col).lower()]
         for col in date_cols:
             df_sop[col] = pd.to_datetime(df_sop[col], errors='coerce')
 
         # 2. Load Orders (Detail Data)
         orders_sheet = next((s for s in sheet_names if s.strip() == "Orders"), None)
-        df_sop['Total_Qty'] = 0 # Default initialization
+        qty_merged = False # Flag to track if we successfully merged quantities
         
         if orders_sheet:
-            # Smart Header for Orders sheet (often starts at row 20+)
+            # Smart Header for Orders sheet
             df_ord_preview = pd.read_excel(xls, sheet_name=orders_sheet, header=None, nrows=30)
-            ord_header_idx = 20 # Default fallback
+            ord_header_idx = 20 # Fallback
             
             for idx, row in df_ord_preview.iterrows():
                 row_str = row.astype(str).str.lower().tolist()
-                # Look for 'order' AND 'number' in the same cell or row
-                # We check if any cell contains both words or if row has them split
+                # Look for 'order' AND 'number'
                 if any('order' in x and 'number' in x for x in row_str):
                     ord_header_idx = idx
                     break
             
             df_orders = pd.read_excel(xls, sheet_name=orders_sheet, header=ord_header_idx)
-            
-            # SAFETY FIX: Force columns to string
             df_orders.columns = df_orders.columns.astype(str).str.strip()
             
-            # Find Order ID in Orders sheet
+            # Identify ID column in Orders
             oid_col = next((c for c in df_orders.columns if 'order' in str(c).lower() and 'number' in str(c).lower()), df_orders.columns[0])
             df_orders.rename(columns={oid_col: 'Order_ID'}, inplace=True)
             
-            # Clean IDs for merging (remove .0 decimals from IDs)
+            # Clean IDs for merging
             df_orders['Order_ID'] = df_orders['Order_ID'].astype(str).str.replace(r'\.0$', '', regex=True)
             
             # Aggregate Quantity
             qty_col = next((c for c in df_orders.columns if 'quantity' in str(c).lower()), None)
+            
             if qty_col:
                 # Ensure Quantity is numeric
                 df_orders[qty_col] = pd.to_numeric(df_orders[qty_col], errors='coerce').fillna(0)
                 df_agg = df_orders.groupby('Order_ID')[qty_col].sum().reset_index()
                 df_agg.rename(columns={qty_col: 'Total_Qty'}, inplace=True)
                 
-                # Merge into S&OP
+                # CLEAN MERGE: Ensure Order_ID types match
                 df_sop['Order_ID'] = df_sop['Order_ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+                df_agg['Order_ID'] = df_agg['Order_ID'].astype(str)
+                
+                # Drop Total_Qty if it somehow already exists in SOP to avoid 'Total_Qty_x' suffix
+                if 'Total_Qty' in df_sop.columns:
+                    df_sop.drop(columns=['Total_Qty'], inplace=True)
+                
                 df_sop = pd.merge(df_sop, df_agg, on='Order_ID', how='left')
-                df_sop['Total_Qty'] = df_sop['Total_Qty'].fillna(0)
+                qty_merged = True
+
+        # Fallback if merge didn't happen
+        if not qty_merged:
+            df_sop['Total_Qty'] = 0
+
+        # Fill NaNs resulting from merge
+        df_sop['Total_Qty'] = df_sop['Total_Qty'].fillna(0)
 
         # 3. Final Polish
         # Normalize Status
@@ -126,7 +132,6 @@ def load_data(uploaded_file):
         return df_sop, sheet_names
         
     except Exception as e:
-        # Improved Error Logging
         st.error(f"⚠️ Error processing file: {e}")
         with st.expander("See technical details (Traceback)"):
             st.code(traceback.format_exc())
@@ -184,18 +189,12 @@ def main():
     total_qty = df['Total_Qty'].sum()
     
     # SAFE STATUS BUCKETS
-    if 'Status' in df.columns:
-        hold_orders = df[df['Status'].str.contains('HOLD', na=False)]
-        open_orders = df[~df['Status'].str.contains('HOLD|COMPLETE|FINAL', na=False)]
-    else:
-        hold_orders = pd.DataFrame(columns=df.columns)
-        open_orders = df
-
-    # Financial Block
+    hold_orders = df[df['Status'].str.contains('HOLD', na=False)]
+    
+    # Payment Block
     payment_col = next((c for c in df.columns if 'payment' in str(c).lower() and 'status' in str(c).lower()), None)
     blocked_payment = pd.DataFrame()
     if payment_col:
-         # Use str.contains carefully
          blocked_payment = df[df[payment_col].astype(str).str.contains('PAYMENT', case=False, na=False)]
 
     # --- MAIN DASHBOARD ---
@@ -234,10 +233,12 @@ def main():
             now = pd.Timestamp.now()
             df['Days_Open'] = (now - df[date_col]).dt.days
             aging_holds = df[(df['Status'].str.contains('HOLD')) & (df['Days_Open'] > 30)].sort_values('Days_Open', ascending=False)
-            st.dataframe(
-                aging_holds[['Order_ID', 'Country', 'Status', 'Days_Open', payment_col] if payment_col else []].head(10),
-                use_container_width=True
-            )
+            if not aging_holds.empty:
+                cols_to_show = ['Order_ID', 'Country', 'Status', 'Days_Open']
+                if payment_col: cols_to_show.append(payment_col)
+                st.dataframe(aging_holds[cols_to_show].head(10), use_container_width=True)
+            else:
+                st.success("No long-term holds detected.")
 
     with tab2:
         st.subheader("Financial Bottlenecks")
@@ -261,13 +262,12 @@ def main():
 
     with tab3:
         st.subheader("Operations Schedule")
-        # Gantt Chart Approximation
         ready_col = next((c for c in df.columns if 'ready' in str(c).lower() and 'date' in str(c).lower()), None)
         ship_col = next((c for c in df.columns if 'shipment' in str(c).lower() and 'date' in str(c).lower()), None)
         
         if ready_col and ship_col:
             gantt_df = df.dropna(subset=[ready_col, ship_col]).copy()
-            gantt_df = gantt_df.head(50) # Limit
+            gantt_df = gantt_df.head(50) 
             
             fig_gantt = px.timeline(
                 gantt_df, 
